@@ -1,0 +1,24 @@
+###
+POST http://localhost:8080/api/users
+Content-Type: application/json
+
+{
+  "nickname": "타파하"
+}
+
+### 1. 고민 등록 (POST)
+POST http://localhost:8080/api/problems
+Content-Type: application/json
+X-User-Id: 1
+
+{
+  "title": "다이어트 중인데 등촌샤브칼국수 먹고 싶음",
+  "choice1": "등촌샤브칼국수 땡개하기",
+  "choice2": "포케먹으면서 우울하기"
+}
+
+### 2. 홈 화면 상태 조회 (GET)
+GET http://localhost:8080/api/problems/home
+X-User-Id: 1
+
+
