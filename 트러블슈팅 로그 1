@@ -1,0 +1,132 @@
+
+
+# Spring Boot & Git 백엔드 실전 개발 가이드
+
+이 문서는 백엔드 API 구현 및 버전 관리 과정에서 도출된 핵심 아키텍처 결정, 문제 해결 방법, 그리고 실제 적용 코드를 기록한 레퍼런스임.
+
+## 1. Git 프로젝트 구조 관리 및 환경 설정
+
+**[개념 및 원리]**
+* **Git Root 인식:** Git은 `.git` 폴더가 위치한 경로를 최상위 루트로 인식함. 초기화 후 파일을 하위 폴더로 묶을 때 윈도우 탐색기를 사용하면 Git의 파일 추적이 끊어짐.
+* **IDE 설정 충돌:** 폴더 구조 변경 시 기존 빌드 파일(`build.gradle`)의 경로가 바뀌어 IDE(IntelliJ)가 소스 루트를 잃어버리는 문제 발생.
+* **인코딩 충돌:** Windows(CRLF, CP949)와 Git(LF, UTF-8) 간의 인코딩 차이로 커밋 메시지 한글 깨짐 및 불필요한 파일 변경점 발생.
+
+**[적용 및 해결 방법]**
+* **터미널을 통한 안전한 디렉토리 이동:**
+    ```bash
+    # 1. 작업 단위 하위 폴더 생성
+    mkdir project_0330
+
+    # 2. git mv를 사용해 파일 이동 (Git 추적 상태 유지)
+    git mv src project_0330/
+    git mv build.gradle project_0330/
+    git mv settings.gradle project_0330/
+    # (.git 폴더는 절대 이동 금지)
+
+    # 3. 변경사항 커밋 및 푸시
+    git add .
+    git commit -m "chore: 프로젝트 디렉토리 구조 재배치"
+    git push origin main
+    ```
+* **IntelliJ 동기화:** 구조 변경 직후 IntelliJ를 완전히 종료하고, `File -> Open`을 통해 **새로 만든 하위 폴더(`project_0330`)**를 직접 지정하여 프로젝트를 다시 열어 Gradle을 로드해야 함.
+* **Git 전역 인코딩 설정 (한번만 실행):**
+    ```bash
+    git config --global core.autocrlf true
+    git config --global i18n.commitEncoding utf-8
+    git config --global i18n.logOutputEncoding utf-8
+    ```
+
+---
+
+## 2. 전역 예외 처리(Global Exception Handling) 및 응답 규격화
+
+**[개념 및 원리]**
+* Spring Boot의 기본 에러 응답은 클라이언트(프론트엔드)가 파싱하기 복잡함.
+* `@RestControllerAdvice`를 활용해 서버 전역에서 발생하는 예외를 가로채고, 일관된 형태의 JSON DTO로 반환하여 API 신뢰성과 협업 효율을 높임.
+
+**[적용 및 해결 방법]**
+* **에러 응답 규격 (DTO) 정의:**
+    ```java
+    // record를 활용한 불변 DTO 생성
+    public record ErrorResponse(int status, String message) {}
+    ```
+* **전역 예외 처리기 구현:**
+    ```java
+    @RestControllerAdvice
+    public class GlobalExceptionHandler {
+
+        // @Valid 검증 실패 (예: 닉네임 길이 초과) 예외 낚아채기
+        @ExceptionHandler(MethodArgumentNotValidException.class)
+        public ResponseEntity<ErrorResponse> handleValidationException(MethodArgumentNotValidException e) {
+            String errorMessage = e.getBindingResult().getAllErrors().get(0).getDefaultMessage();
+            return ResponseEntity.badRequest().body(new ErrorResponse(400, errorMessage));
+        }
+        
+        // 비즈니스 로직 예외 처리
+        @ExceptionHandler(IllegalStateException.class)
+        public ResponseEntity<ErrorResponse> handleIllegalStateException(IllegalStateException e) {
+            return ResponseEntity.badRequest().body(new ErrorResponse(400, e.getMessage()));
+        }
+    }
+    ```
+* **데이터 없는 200 OK 응답 처리:** (클라이언트에 돌려줄 데이터가 없을 경우)
+    ```java
+    @PostMapping("/api/problems/{id}/resolve")
+    public ResponseEntity<Void> resolveProblem() {
+        // 로직 처리...
+        return ResponseEntity.ok().build(); // 본문 없이 상태 코드만 반환
+    }
+    ```
+
+---
+
+## 3. JPA Dirty Checking과 지연 평가(Lazy Evaluation) 기반 상태 업데이트
+
+**[개념 및 원리]**
+* **요구사항:** 데이터 생성 후 72시간이 경과하면 자동으로 상태를 변경해야 함.
+* **스케줄러의 한계:** Spring `@Scheduled`로 매 분마다 DB를 풀스캔하면 데이터 누적 시 심각한 서버 부하 발생.
+* **지연 평가(Lazy Evaluation) 도입:** 백그라운드 스캔 대신, 사용자가 **해당 데이터를 조회(GET)하는 시점**에 시간을 계산하여 조건을 만족하면 그 즉시 상태를 업데이트하는 아키텍처 채택.
+* **JPA Dirty Checking:** `@Transactional` 블록 내에서 영속성 컨텍스트가 관리하는 엔티티 객체의 필드 값을 변경하면, 메서드 종료 시 자동으로 DB에 `UPDATE` 쿼리가 발생함. (`save()` 호출 불필요)
+
+**[적용 및 해결 방법]**
+```java
+// 조회 로직이지만 데이터 수정(Dirty Checking)이 동반되므로 readOnly = true 옵션 제거 필수
+@Transactional 
+public HomeStatusResponse getHomeStatus(Long userId) {
+    Problem problem = problemRepository.findActiveProblem(userId);
+    
+    // 1. 현재 시간과 DB 생성 시간 간의 차이 계산
+    long elapsedHours = Duration.between(problem.getCreatedAt(), LocalDateTime.now()).toHours();
+
+    // 2. 지연 평가: 72시간 경과 여부 확인
+    if (elapsedHours >= 72) {
+        Long randomChoiceId = // 무작위 선택 로직...
+        
+        // 3. 엔티티 상태 변경 (메서드 종료 시 UPDATE 쿼리 자동 발생)
+        problem.resolve(randomChoiceId); 
+        
+        return HomeStatusResponse.empty(); 
+    }
+    
+    return new HomeStatusResponse(..., 72 - elapsedHours); // 남은 시간 반환
+}
+```
+
+---
+
+## 4. 시간에 의존적인 비즈니스 로직 테스트 방법론 (H2 DB)
+
+**[개념 및 원리]**
+* 72시간 경과 로직을 검증하기 위해 실제 시간을 기다리는 것은 불가능함.
+* 인메모리 DB(H2)는 서버 재시작 시 데이터가 모두 증발하므로, 서버를 켜둔 상태에서 데이터를 삽입하고 생성 시간을 강제로 과거로 변조하는 방식의 테스트를 수행해야 함.
+
+**[적용 및 해결 방법 (시간 조작 4단계)]**
+1.  **데이터 적재:** POST API 호출로 DB에 테스트 데이터 1건 생성.
+2.  **H2 콘솔 접속 및 시간 변조 쿼리 실행:**
+    * 브라우저에서 `http://localhost:8080/h2-console` 접속
+    * 다음 SQL 쿼리를 실행하여 생성 시간을 4일 전으로 조작:
+    ```sql
+    UPDATE PROBLEM SET CREATED_AT = DATEADD('DAY', -4, NOW()) WHERE ID = 1;
+    ```
+3.  **지연 평가 트리거 작동:** 상태 조회 GET API를 다시 호출. (이때 서버 내부 로직이 72시간 경과를 감지하고 상태를 업데이트함)
+4.  **최종 검증:** H2 콘솔에서 `SELECT * FROM PROBLEM;`을 실행하여 `STATUS` 칼럼의 값이 의도한 상태(`SOLVED` 등)로 변경되었는지 사실 관계 확인.
